@@ -1,20 +1,19 @@
+//Libraries used are the Arduino PID library, ESP8266 built in libraries, aws-sdk-esp8266, DHT, TimeLib, and RCSwitch libraries
 #include <PID_v1.h>
-
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
-
 #include "Esp8266AWSImplementations.h"
 #include "AmazonDynamoDBClient.h"
 #include "AWSFoundationalTypes.h"
 #include "keys.h"
-
 #include <DHT.h>
 #include <Wire.h>
+#include <RCSwitch.h>
+#include <TimeLib.h>
 //Not using a LCD screen anymore - deprecated
 //#include <LiquidCrystal_I2C.h>
-#include <RCSwitch.h>
 
-// RTC fields
+// RTC data fields - used for data restore on device reset. This is largely taken from the RTC example in the ESP8266 library.
 // CRC function used to ensure data validity
 uint32_t calculateCRC32(const uint8_t *data, size_t length);
 
@@ -28,7 +27,6 @@ void printMemory();
 // We use byte array as an example.
 struct {
   uint32_t crc32;
-//  byte data[508];
   float t5;
   float t90;
   float u5;
@@ -44,18 +42,17 @@ struct {
   unsigned long last1d;
 } rtcData;
 
-
-String inData;
-
-//int sendPin = 2;
+//Initializing transistor pins
 int transistorPin = 14;
 int incomingByte;  // a variable to read incoming serial data into
-//int ledPin = 13; // the pin that the LED is attached to
-//int cycle;
+//Setpoint hardcoded, will switch to a GetItem from DynamoDB in the future
 double setPoint = 69.0;
-double pidOutput, currentWindowPidOutput = 0;
+//Intializing the PID output, to avoid errors on the first PID run
+double pidOutput = 0;
+//Setting to store transistor state
 int transistorGate;
 
+//This section of floats and counter ints stores the current and running data for the data that will be outputted to DynamoDB 
 float temp_f_sum_20s, temp_f_sum_5m, temp_f_sum_90m = 0;
 float humidity_sum_20s, humidity_sum_5m, humidity_sum_90m = 0;
 float pid_sum_20s, pid_sum_5m, pid_sum_90m = 0;
@@ -66,9 +63,6 @@ float temp_f_inst_90m, humidity_inst_90m, pid_inst_90m, heater_inst_90m = 0;
 float temp_f_inst_1d, humidity_inst_1d, pid_inst_1d, heater_inst_1d = 0;
 
 float heater_now;
-
-// don't think I need these if the arrays themselves are stored in EEPROM - actually now RTC memory
-// float reset_humidity_5m, reset_humidity_90m, reset_temp_f_5m, reset_temp_f_90m, reset_pid_sum_5m, reset_pid_sum_90m, reset_heater_inst_5m, reset_heater_inst_90m = 0;
 
 int counter_20s = 0;
 int counter_5m = 0;
@@ -82,30 +76,25 @@ const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of th
 
 byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
 
-// A UDP instance to let us send and receive packets over UDP
 WiFiUDP udp;
 
+//Variables to keep track of current and past upload time (format is seconds since last unix epoch)
 unsigned long epoch, epoch_initial, epoch_now, epoch_last_5m, epoch_last_90m, epoch_last_1d;
 
+//Currently not in use, this is a setting that should trip and stop average uploads if too many lower level time periods have passed (i.e. if the 5min average has taken 100 measurements of 20sec apiece)
 bool flagDontPushAvgTemp = false; 
 
-// PID tuning
-double KP = 25;  // X degrees out = 100% heating
-double KI = 0.028; // X% per degree per minute
+// PID tuning variables 
+double KP = 25;
+double KI = 0.028;
 double KD = 0;   // Not yet used
 unsigned long windowSize = 1800000; // 30 minutes (ish)
 
-unsigned long windowStartTime;
+//Variable to keep track of PID window
+unsigned long windowStartTime = 0;
+
+//Variable to keep track of heater on or off state
 boolean stateVariable = false;
-//int heaterOn;
-
-
-#define DELAYSHORT 160
-#define DELAYLONG  500
-#define VIRTUAL_PIN V1
-#define VIRTUAL_PIN V2
-#define VIRTUAL_PIN V3
-#define REST      1000
 
 //AWS constants
 const char* AWS_REGION = "us-west-1";
@@ -114,37 +103,38 @@ const char* AWS_ENDPOINT = "amazonaws.com";
 // Constants describing DynamoDB table and values being used
 const char* TABLE_NAME1 = "Temperatures_20_sec";
 const char* HASH_KEY_NAME1 = "Id";
-const char* HASH_KEY_VALUE1 = "Thermostat_01"; // Our sensor ID, to be REPLACED in case of multiple sensors.
+const char* HASH_KEY_VALUE1 = "Thermostat_01"; // My sensor ID
 const char* RANGE_KEY_NAME1 = "Date";
 
 const char* TABLE_NAME3 = "Temperatures_5_min";
 const char* HASH_KEY_NAME3 = "Id";
-const char* HASH_KEY_VALUE3 = "Thermostat_01"; // Our sensor ID, to be REPLACED in case of multiple sensors.
+const char* HASH_KEY_VALUE3 = "Thermostat_01";
 const char* RANGE_KEY_NAME3 = "Date";
 
 const char* TABLE_NAME4 = "Temperatures_90_min";
 const char* HASH_KEY_NAME4 = "Id";
-const char* HASH_KEY_VALUE4 = "Thermostat_01"; // Our sensor ID, to be REPLACED in case of multiple sensors.
+const char* HASH_KEY_VALUE4 = "Thermostat_01";
 const char* RANGE_KEY_NAME4 = "Date";
 
 const char* TABLE_NAME5 = "Temperatures_1_day";
 const char* HASH_KEY_NAME5 = "Id";
-const char* HASH_KEY_VALUE5 = "Thermostat_01"; // Our sensor ID, to be REPLACED in case of multiple sensors.
+const char* HASH_KEY_VALUE5 = "Thermostat_01";
 const char* RANGE_KEY_NAME5 = "Date";
 
 const char* TABLE_NAME2 = "HeaterManualState";
 const char* HASH_KEY_NAME2 = "Id";
-const char* HASH_KEY_VALUE2 = "Website"; // Our sensor ID, to be REPLACED in case of multiple sensors.
+const char* HASH_KEY_VALUE2 = "Website";
 const char* RANGE_KEY_VALUE2 = "1";
 const char* RANGE_KEY_NAME2 = "Date";
 static const int KEY_SIZE = 2;
 
+//Variable to internally track the heater state of the website
 static int WebsiteHeaterState;
 
+//DynamoDB objects
 Esp8266HttpClient httpClient;
+//I suspect the ESP8266 AWS DateTimeProvider is causing some of the device crashes, so I'm rolling my own
 Esp8266DateTimeProvider dateTimeProvider;
-
-/* Reused objects. */
 GetItemInput getItemInput;
 PutItemInput putItemInput;
 AttributeValue hashKey;
@@ -153,32 +143,32 @@ ActionError actionError;
 
 AmazonDynamoDBClient ddbClient;
 
+//LCD screen no longer used
 //LiquidCrystal_I2C  lcd(0x3F, 4, 5);
 
 RCSwitch mySwitch = RCSwitch();
 
+//Temperature sensor variables
 DHT dht(5, DHT22, 20);
 double humidity, temp_f = 0;
 
+//PID variable initial setting
 PID myPID(&temp_f, &pidOutput, &setPoint, KP, KI, KD, DIRECT);
 
-// Generally, you should use "unsigned long" for variables that hold time
-unsigned long lastTimeUpdate, lastTempUpdate, lastOutputUpdate, lastHeaterRefresh = 0;
+//Loop and AWS offset time variables 
+unsigned long lastTimeUpdate, lastTempOutputUpdate, lastHeaterRefresh, awsoffset = 0;
 
-int value = 0;
-long rssi;
-IPAddress ip;
-
+//Setup section
 void setup()
 {
   Serial.begin(115200);
   Serial.println("Serial initialized...");
 
-  // Set pins for transistor and LED blink
+  // Set pins for transistor and onboard LED blink
   pinMode(transistorPin, OUTPUT);
   pinMode(LED_BUILTIN, OUTPUT);
 
-  //Initialize Wifi - ssid and password taken from keys.h
+  //Initialize Wifi - ssid and password manually set in and then taken from keys.h in the AWS SDK library
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     yield();
@@ -229,10 +219,9 @@ void setup()
     yield();
     myPID.Compute();
   }
-  currentWindowPidOutput = pidOutput;
 
   Serial.print("Initial PID output: ");
-  Serial.println(currentWindowPidOutput);
+  Serial.println(pidOutput);
 
   //Initialize DynamoDB client
   ddbClient.setAWSRegion(AWS_REGION);
@@ -242,6 +231,7 @@ void setup()
   ddbClient.setHttpClient(&httpClient);
   ddbClient.setDateTimeProvider(&dateTimeProvider);
 
+  //Attempt to read the RTC memory to see if there are any long-time upload data remaining from before the device reset, and if read is valid then set the available data
   if (ESP.rtcUserMemoryRead(0, (uint32_t*) &rtcData, sizeof(rtcData))) {
     Serial.println("RTC Read: ");
     printMemory();
@@ -283,15 +273,6 @@ void setup()
 }
 
 //Debugger functions for troubleshooting
-void yieldEspCPUSetup(int x) {
-  delay(100);
-  ESP.wdtFeed();
-  yield();
-  Serial.print("SetupDebug");
-  Serial.print(x);
-  Serial.print(",");
-}
-
 void yieldEspCPUTime(int x) {
 //  delay(100);
   ESP.wdtFeed();
@@ -319,129 +300,80 @@ void yieldEspCPU(int x) {
   Serial.print(",");
 }
 
-void getWebsiteHeaterState(int *WebsiteHeaterState, GetItemOutput getItemOutput) {
-  char szC[6];
-  // Serial.println("GetItem succeeded!");
-  yieldEspCPUTemp(7);
-
-  /* Get the "item" from the getItem output. */
-  MinimalMap < AttributeValue > attributeMap = getItemOutput.getItem();
-  AttributeValue av;
-
-  yieldEspCPUTemp(8);
-      
-  // Get the rgb values and set the led with them. //
-  attributeMap.get("WebsiteHeaterState", av);
-  *WebsiteHeaterState = atoi(av.getS().getCStr());
-//  Serial.print("Website Heater State:   ");
-//  Serial.println(*WebsiteHeaterState);
-
-  //        attributeMap.get("G", av);
-  //        *G = atoi(av.getS().getCStr());
-  //        Serial.print("Green value read: ");
-  //        Serial.println(*G);
-  //
-  //        attributeMap.get("B", av);
-  //        *B = atoi(av.getS().getCStr());
-  //        Serial.print("Blue value read:  ");
-  //        Serial.println(*B);
-
-  delay(10);
-  //        Serial.print("\n\n");
-}
-
-
 void loop() {
+  //Increment program loop timer
   unsigned long now = millis();
 
-    Serial.print("ML9, ");
-//  yieldEspCPU(9);
-
+    //'ML', 'TD', and 'TE' serial prints also used for debugging
+    Serial.print("ML1, ");
   
+  //NTP time request loop, executes every 10 sec
   if ( now - lastTimeUpdate > 10000) {
     Serial.println();
     Serial.print("Sending NTP request");
     Serial.println();
-//    yieldEspCPU(10);
     sendNTPpacket(timeServerIP);
-//    getTheTime();
-//    yieldEspCPU(11);
-//    Serial.println();
-//    Serial.println("Time Successful");
-//    Serial.println();
+    yield();
     lastTimeUpdate = now;
   }
 
+  Serial.print("ML2, ");
+  
+  //Time update, executes when a time server request has successfully returned
   uint32_t time = getTheTime();
+  yield();
   if (time) {
-    Serial.print("X");
-    Serial.print(time);
-    epoch = time;
-    Serial.print(epoch);
-    
-    //Setting inital average update times if they do not exist (RTC memory)
-    if (!epoch_initial) {
-    epoch_initial = epoch;
-    epoch_last_5m = epoch;
-    epoch_last_90m = epoch;
-    epoch_last_1d = epoch;
-  } 
-  if (!epoch_last_5m) {
-    //Just in case RTC memory loads a update time for 90m/1d that would be sooner than the 5m
-      epoch_last_5m = epoch;
-  }
-    epoch_now = epoch;
-    Serial.println("Time successful");
+	    epoch = time;
+	    
+	    //Setting inital average update times if they do not exist (after inialization or in RTC memory)
+	    if (!epoch_initial) {
+	    epoch_initial = epoch;
+	    epoch_last_5m = epoch;
+	    epoch_last_90m = epoch;
+	    epoch_last_1d = epoch;
+	    } 
+	  if (!epoch_last_5m) {
+	    //Just in case RTC memory loads a update time for 90m/1d that would be sooner than the 5m
+	      epoch_last_5m = epoch;
+	  }
+	    epoch_now = epoch;
+	    Serial.println("Time successful");
   }
 
-    Serial.print("ML12, ");
-//  yieldEspCPU(12);
+    Serial.print("ML3, ");
   
-  if ( now - lastTempUpdate > 20000 ) {
-    //    String MyIp;
-    //    String Both;
-    //    MyIp =  "IP: " + String(WiFi.localIP()[0]) + "." + String(WiFi.localIP()[1]) + "." + String(WiFi.localIP()[2]) + "." + String(WiFi.localIP()[3]);
-    //    String MyWiFi;
-    //    MyWiFi = "WiFi: " + String(WiFi.RSSI());
-    //    Serial.println(MyIp);
-    //    Serial.println(MyWiFi);
+  //Temperature then output update loop, executes every 20 sec 
+  if ( now - lastTempOutputUpdate > 20000 ) {
     Serial.println();
     Serial.print("Get Temp-");
-    Serial.print("ML13, ");
-//    yieldEspCPU(13);
     Serial.println();
     gettemperature();
+    yield();
     Serial.println();
-    Serial.print("ML14, ");
-//    yieldEspCPU(14);
     Serial.println("Temp Successful");
-    //    Serial.print("Sending temperature:");
-    //    Serial.println(temp_f);
-    //    Serial.print("Sending humidity:");
-    //    Serial.println(humidity);
-    lastTempUpdate = now;
-  }
-  
-    Serial.print("ML15, ");
-//  yieldEspCPU(15);
-  
-  if ( now - lastOutputUpdate > 20000 ) {
     Serial.println();
     Serial.print("Update Output-");
-    Serial.print("ML16, ");
-//    yieldEspCPU(16);
     updateOutput();
-    Serial.print("ML17, ");
-//    yieldEspCPU(17);
+    yield();
     Serial.println("Successful");
     Serial.println();
-    lastOutputUpdate = now;
+    lastTempOutputUpdate = now;
   }
+  
+    Serial.print("ML4, ");
+  
+  //Now combined into the temperature loop - PID output/heater control update loop, executes every 20 sec
+  //if ( now - lastOutputUpdate > 20000 ) {
+  //}
 
-//  delay(1000);
+   // Serial.print("ML5, ");
 
+    yield();
+
+    Serial.print("ML6, ");
 }
 
+//Checksum function to validate RTC data
 uint32_t calculateCRC32(const uint8_t *data, size_t length)
 {
   uint32_t crc = 0xffffffff;
@@ -461,18 +393,8 @@ uint32_t calculateCRC32(const uint8_t *data, size_t length)
   return crc;
 }
 
+//RTC memory printout
 void printMemory() {
-//  char buf[3];
-//  for (int i = 0; i < sizeof(rtcData); i++) {
-//    sprintf(buf, "%02X", rtcData.data[i]);
-//    Serial.print(buf);
-//    if ((i + 1) % 32 == 0) {
-//      Serial.println();
-//    }
-//    else {
-//      Serial.print(" ");
-//    }
-//  }
   Serial.println();
   Serial.print("t5:");
   Serial.print(rtcData.t5);
@@ -503,67 +425,44 @@ void printMemory() {
   Serial.println();
 }
 
-uint32_t getTheTime() { // Get the NTP time for averaging over the longer intervals
+uint32_t getTheTime() { // Get the NTP time for averaging over the longer intervals - code largely similar to Arduino NTP example
+  //Initial delay to wait for NTP time server response
+  unsigned long tempoffset = millis();
   delay(1000);
   
   if (udp.parsePacket() == 0) {
     return 0;
   }
-//  int cb = udp.parsePacket();
-   
+  
+  //Initializing the AWS offset for AWS packet time purposes
+  awsoffset = tempoffset; 
+
   udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
 
   Serial.print("TD22, ");
-//  yieldEspCPUTime(22);
   
   unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
   unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
   // combine the four bytes (two words) into a long integer
   // this is NTP time (seconds since Jan 1 1900):
   unsigned long secsSince1900 = highWord << 16 | lowWord;
-  //  Serial.print("Seconds since Jan 1 1900 = " );
-  //  Serial.println(secsSince1900);
   
   Serial.print("TD23, ");
-  Serial.print(secsSince1900);
-//  yieldEspCPUTime(23);
 
-  // now convert NTP time into everyday time:
-  //  Serial.print("Unix time = ");
   // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
   const unsigned long seventyYears = 2208988800UL;
-  // subtract seventy years:
+  // subtract seventy years for Unix time:
   unsigned long UNIXTime = secsSince1900 - seventyYears;
   return UNIXTime;
-  // print Unix time:
-//        Serial.print((epoch  % 86400L) / 3600); // print the hour (86400 equals secs per day)
-//        Serial.print(':');
-//        if (((epoch % 3600) / 60) < 10) {
-//          // In the first 10 minutes of each hour, we'll want a leading '0'
-//          Serial.print('0');
-//        }
-//        Serial.print((epoch  % 3600) / 60); // print the minute (3600 equals secs per minute)
-  yieldEspCPUTime(24);
-
-
-//      Serial.println("Seconds since 1900, now");
-//      Serial.println(epoch_now);
-//      Serial.println("Seconds since 1900, last 5min check");
-//      Serial.println(epoch_last_5m);
-//      Serial.println("Seconds between");
-//      Serial.println(epoch_now - epoch_last_5m);
 }
 
-// send an NTP request to the time server at the given address
+// send an NTP request to the time server at the given address - also largely from Arduino NTP example
 void sendNTPpacket(IPAddress& address) {
-//  Serial.println("sending NTP packet...");
-  // set all bytes in the buffer to 0
-//  yieldEspCPUTime(25);
+
     Serial.print("TD25, ");
   
   memset(packetBuffer, 0, NTP_PACKET_SIZE);
   // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
   packetBuffer[0] = 0b11100011;   // LI, Version, Mode
   packetBuffer[1] = 0;     // Stratum, or type of clock
   packetBuffer[2] = 6;     // Polling Interval
@@ -578,394 +477,43 @@ void sendNTPpacket(IPAddress& address) {
 
   // all NTP fields have been given values, now
   // you can send a packet requesting a timestamp:
-//  yieldEspCPUTime(27);
-//  ESP.wdtDisable();
   udp.beginPacket(address, 123); //NTP requests are to port 123
-//  ESP.wdtEnable(0);
-//    Serial.print("28, ");
+
     Serial.print("TD27, ");
-//  yieldEspCPUTime(28);
-//  ESP.wdtDisable();
+  
+  //I've been getting a good amount of controller resets (watchdog timer and otherwise) at this step, need more investigation
   udp.write(packetBuffer, NTP_PACKET_SIZE);
-//  ESP.wdtEnable(0);
-//    Serial.print("29, ");
+
     Serial.print("TD28, ");
-//  yieldEspCPUTime(29);
-//  ESP.wdtDisable();
+
   udp.endPacket();
   yield();
-//  ESP.wdtEnable(0);
+
     Serial.print("TD29, ");
-//  yieldEspCPUTime(30);
-}
-
-
-void updateOutput() {
-  unsigned long now2 = millis();
-//  yieldEspCPU();
-//
-//  Serial.print("Before Computation: ");
-//  Serial.print("temp_f: ");
-//  Serial.print(temp_f);
-//  Serial.print(" pidOutput: ");
-//  Serial.print(pidOutput);
-//  Serial.print(" setPoint: ");
-//  Serial.print(setPoint);
-//  Serial.print(" KP: ");
-//  Serial.print(KP);
-//  Serial.print(" KI: ");
-//  Serial.print(KI);
-//  Serial.print(" KD: ");
-//  Serial.println(KD);
-
-  //  &temp_f, &pidOutput, &setPoint, KP, KI, KD,
-
-  if (!isnan(temp_f)) {
-    myPID.Compute();
-  }
-
-  //  &temp_f, &pidOutput, &setPoint, KP, KI, KD,
-
-//  Serial.print("After  Computation: ");
-//  Serial.print("temp_f: ");
-//  Serial.print(temp_f);
-//  Serial.print(" pidOutput: ");
-//  Serial.print(pidOutput);
-//  Serial.print(" setPoint: ");
-//  Serial.print(setPoint);
-//  Serial.print(" KP: ");
-//  Serial.print(KP);
-//  Serial.print(" KI: ");
-//  Serial.print(KI);
-//  Serial.print(" KD: ");
-//  Serial.println(KD);
-
-  //  Serial.print("Current PID output: ");
-  //  Serial.println(pidOutput);
-
-  if (now2 - windowStartTime > windowSize) {
-    //time to shift the window
-    windowStartTime += windowSize;
-    currentWindowPidOutput = pidOutput;
-  }
-
-
-
-  //  Serial.print("Window Start Time: ");
-  //  Serial.println(windowStartTime);
-//  Serial.print("Now2 - Window Start Time: ");
-//  Serial.println(now2 - windowStartTime);
-  //
-  //  Serial.print("Now2 - Window Start Time * 100: ");
-  //  Serial.println((now2 - windowStartTime) * 100);
-  //  Serial.print("currentwPidOutput * windowSize: ");
-  //  Serial.println(currentWindowPidOutput * windowSize);
-  //
-//  Serial.print("Switch setting before evaluation: ");
-//  Serial.println(stateVariable);
-
-
-  //  Serial.print("test: ");
-  //  Serial.print(currentWindowPidOutput * windowSize > ((now2 - windowStartTime) * 100));
-  //  Serial.print(stateVariable);
-  //  Serial.print(!stateVariable);
-  //  Serial.println((currentWindowPidOutput * windowSize > ((now2 - windowStartTime) * 100)) && (!stateVariable));
-
-  if ((WebsiteHeaterState == 1) && (stateVariable))
-  {
-    stateVariable = !stateVariable;
-    Serial.println("Manual Control set to Off & Switch is On - Turning it Off");
-    OffOutlet();
-  }
-  else if ((WebsiteHeaterState == 3) && (!stateVariable))
-  {
-    stateVariable = !stateVariable;
-    Serial.println("Manual Control set to On & Switch is Off - Turning it On");
-    OnOutlet();
-  }
-  else if ((WebsiteHeaterState == 2) && (currentWindowPidOutput * windowSize > ((now2 - windowStartTime) * 100)) && (!stateVariable))
-  {
-    stateVariable = !stateVariable;
-    Serial.println("Automatic Control - Turning On");
-    OnOutlet();
-  }
-  else if ((WebsiteHeaterState == 2) && (currentWindowPidOutput * windowSize < ((now2 - windowStartTime) * 100)) && (stateVariable))
-  {
-    stateVariable = !stateVariable;
-    Serial.println("Automatic Control - Turning Off");
-    OffOutlet();
-  }
-
-
-//  Serial.print("Switch setting after evaluation : ");
-//  Serial.println(stateVariable);
-
-
-  //  // Every 400 cycles (about 8 seconds) refresh the heater state
-  //  if( now2 - lastHeaterRefresh > 8000 ) {
-  //    setHeaterState(heaterOn);
-  //    lastHeaterRefresh = now2;
-  //  }
-}
-
-//void setHeaterState(boolean desiredState) {
-//  if (desiredState = true){
-//    OnOutlet();
-//  }
-//  else
-//  {
-//    OffOutlet();
-//  }
-//}
-
-void awsGetWebsiteHeaterState(int *WebsiteHeaterState) {
-
-  Serial.print("TE 31, ");
-//  yieldEspCPUTemp(31);
-  /* Pull Heater State. */
-  AttributeValue id;
-  id.setS(HASH_KEY_VALUE2);
-  rangeKey.setN(RANGE_KEY_VALUE2);
-
-  Serial.print("TE 32, ");
-//  yieldEspCPUTemp(32);
-
-  MinimalKeyValuePair < MinimalString, AttributeValue > pair1(HASH_KEY_NAME2, id);
-  MinimalKeyValuePair < MinimalString, AttributeValue > pair2(RANGE_KEY_NAME2, rangeKey);
-  MinimalKeyValuePair<MinimalString, AttributeValue> keyArray[] = { pair1, pair2 };
-  getItemInput.setKey(MinimalMap < AttributeValue > (keyArray, KEY_SIZE));
-
-//  yieldEspCPUTemp();
-  
-  MinimalString attributesToGet[] = { "WebsiteHeaterState" };
-  getItemInput.setAttributesToGet(MinimalList < MinimalString > (attributesToGet, 1));
-
-  // Set Table Name
-  getItemInput.setTableName(TABLE_NAME2);
-
-  Serial.print("TE 33, ");
-//  yieldEspCPUTemp(33);
-
-  // Perform getItem and check for errors.
-//  ESP.wdtDisable();
-  yieldEspCPU(62);
-  GetItemOutput getItemOutput = ddbClient.getItem(getItemInput, actionError);
-  yieldEspCPU(63);
-//  ESP.wdtEnable(0);
-
-  Serial.print("TE 34, ");  
-//  yieldEspCPUTemp(34);
-
-  ESP.wdtDisable();
-  switch (actionError) {
-
-  Serial.print("TE 35, ");
-//    yieldEspCPUTemp(35);
-    
-    case NONE_ACTIONERROR:
-      getWebsiteHeaterState(WebsiteHeaterState, getItemOutput);
-      break;
-
-    case INVALID_REQUEST_ACTIONERROR:
-      Serial.print("ERROR: ");
-      Serial.println(getItemOutput.getErrorMessage().getCStr());
-      break;
-    case MISSING_REQUIRED_ARGS_ACTIONERROR:
-      Serial.println("ERROR: Required arguments were not set for GetItemInput");
-      break;
-    case RESPONSE_PARSING_ACTIONERROR:
-      Serial.println("ERROR: Problem parsing http response of GetItem\n");
-      break;
-    case CONNECTION_ACTIONERROR:
-      Serial.println("ERROR: Connection problem");
-      break;
-  }
-  
-  Serial.print("TE 36, ");
-//  yieldEspCPUTemp(36);
-  ESP.wdtEnable(0);
-}
-
-void PushTempToDynamoDB(float temp_f_update, float humidity_update, float pid_update, float heater_update, const char* T_N, const char* HK_N, const char* HK_V, const char* RK_N) {
-
-  Serial.print("TE 37, ");
-//  yieldEspCPUTemp(37);
-  
-    /* Create an Item. */
-  AttributeValue id;
-  id.setS(HK_V);
-  AttributeValue timest;
-  timest.setN(dateTimeProvider.getDateTime());
-
-  /* Create an AttributeValue for 'temp', convert the number to a
-     string (AttributeValue object represents numbers as strings), and
-     use setN to apply that value to the AttributeValue. */
-
-  int d1 = temp_f_update;
-  float f2 = temp_f_update - d1;
-  int d2 = f2 * 100 + 1;
-
-  char numberBuffer[20];
-  AttributeValue tempAttributeValue;
-  snprintf(numberBuffer, 20, "%d.%02d", d1, d2);
-  tempAttributeValue.setN(numberBuffer);
-
-
-//  yieldEspCPUTemp();
-
-
-  int d3 = pid_update;
-  float f3 = pid_update - d3;
-  int d4 = f3 * 100 + 1;
-
-  char pidBuffer[20];
-  AttributeValue pidAttributeValue;
-  snprintf(pidBuffer, 20, "%d.%02d", d3, d4);
-  pidAttributeValue.setN(pidBuffer);
-
-
-//  yieldEspCPUTemp();
-
-
-  int d7 = heater_update;
-  float f5 = heater_update - d7;
-  int d8 = f5 * 100 + 1;
-
-  char heaterbuffer[20];
-  AttributeValue heaterOnState;
-  snprintf(heaterbuffer, 20, "%d.%02d", d7, d8);
-  heaterOnState.setN(heaterbuffer);
-
-
-//  yieldEspCPUTemp();
-
-  int d5 = humidity_update;
-  float f4 = humidity_update - d5;
-  int d6 = f4 * 100 + 1;
-
-  char humidityBuffer[20];
-  AttributeValue humidityAttributeValue;
-  snprintf(humidityBuffer, 20, "%d.%02d", d5, d6);
-  humidityAttributeValue.setN(humidityBuffer);
-
-//  char piddebugbuffer[100];
-//  AttributeValue PIDdebug;
-//  snprintf(piddebugbuffer, 100, "temp_f: %f pidOutput: %f setPoint: %f KP: %f KI: %f KD: %f", temp_f, pidOutput, setPoint, KP, KI, KD);
-//  PIDdebug.setS(piddebugbuffer);
-//
-//
-//  yieldEspCPU();
-
-//  Serial.println(numberBuffer);
-//  Serial.println(pidBuffer);
-//  Serial.println(heaterbuffer);
-//  Serial.println(humidityBuffer);
-  
-
-  /* Create the Key-value pairs and make an array of them. */
-  MinimalKeyValuePair < MinimalString, AttributeValue
-  > att1(HK_N, id);
-  MinimalKeyValuePair < MinimalString, AttributeValue
-  > att2(RK_N, timest);
-  MinimalKeyValuePair < MinimalString, AttributeValue
-  > att3("temp", tempAttributeValue);
-  MinimalKeyValuePair < MinimalString, AttributeValue
-  > att4("pidOutput", pidAttributeValue);
-  MinimalKeyValuePair < MinimalString, AttributeValue
-  > att5("heaterState", heaterOnState);
-  MinimalKeyValuePair < MinimalString, AttributeValue
-  > att6("humidity", humidityAttributeValue);
-  MinimalKeyValuePair<MinimalString, AttributeValue> itemArray[] = { att1,
-                                                                     att2, att3, att4, att5, att6
-                                                                   };
-
-  Serial.print("TE 38, ");
-//  yieldEspCPUTemp(38);
-
-  ESP.wdtDisable();
-  ESP.wdtEnable(0);
-  if (!isnan(temp_f)) {
-    
-    /* Set values for putItemInput. */
-    putItemInput.setItem(MinimalMap < AttributeValue > (itemArray, 6));
-    putItemInput.setTableName(T_N);
-    
-  Serial.print("TE 39, ");
-//    yieldEspCPUTemp(39);
-    /* Perform putItem and check for errors. */
-//    ESP.wdtDisable();
-  Serial.print("TE 60, ");
-//    yieldEspCPU(60);
-    PutItemOutput putItemOutput = ddbClient.putItem(putItemInput,
-                                  actionError);
-  Serial.print("TE 61, ");                              
-//    yieldEspCPU(61);
-//    ESP.wdtEnable(0);
-  Serial.print("TE 40, ");
-//    yieldEspCPUTemp(40);
-    
-    switch (actionError) {
-      case NONE_ACTIONERROR:
-//        Serial.println("PutItem succeeded!");
-        break;
-      case INVALID_REQUEST_ACTIONERROR:
-        Serial.print("ERROR: Invalid request");
-        Serial.println(putItemOutput.getErrorMessage().getCStr());
-        break;
-      case MISSING_REQUIRED_ARGS_ACTIONERROR:
-        Serial.println(
-          "ERROR: Required arguments were not set for PutItemInput");
-        break;
-      case RESPONSE_PARSING_ACTIONERROR:
-        Serial.println("ERROR: Problem parsing http response of PutItem");
-        break;
-      case CONNECTION_ACTIONERROR:
-        Serial.println("ERROR: Connection problem");
-        break;
-    }
-    /* wait to not double-record */
-  }
-    Serial.print("DUBRECWAIT, ");
-//  ESP.wdtDisable();
-  delay(2000);
-  Serial.print("PDUBRECWAIT, ");
-//  ESP.wdtEnable(0);
-  
 }
 
 void gettemperature() {
-  // Wait at least 2 seconds seconds between measurements.
-  // if the difference between the current time and last time you read
-  //   the sensor is bigger than the interval you set, read the sensor
-  //   Works better than delay for things happening elsewhere also
-  /*unsigned long currentMillis = millis();
 
-    if(currentMillis - previousMillis >= interval) {
-    // save the last time you read the sensor
-    previousMillis = currentMillis;   */
   Serial.print("TE 41, ");
-//  yieldEspCPUTemp(41);
   
-  // Reading temperature for humidity takes about 250 milliseconds!
+  // Reading temperature for humidity takes about 250 milliseconds
   // Sensor readings may also be up to 2 seconds 'old' (it's a very slow sensor)
   humidity = dht.readHumidity();          // Read humidity (percent)
   temp_f = dht.readTemperature(true);     // Read temperature as Farenheight
-  Serial.print("TE 42, ");
-//  yieldEspCPUTemp(42);
 
-  //    // Check if any reads failed and exit early (to try again).
+  Serial.print("TE 42, ");
+
+  // Check if any reads failed
   if (isnan(humidity) || isnan(temp_f)) {
-//    Serial.println("Failed to read from DHT sensor! Humidity:");
-//    Serial.println(humidity);
-//    Serial.println("temp:");
-//    Serial.println(temp_f);
+    //If reads failed try to re-read sensor
     byte hu;
     for (hu = 0; hu < 30; hu++)
     {
       temp_f = dht.readTemperature(true);
       if isnan(temp_f) {
+
         Serial.print("TE 43, ");
-//        yieldEspCPU(43);
+	
         delay(150);
         temp_f = dht.readTemperature(true);
       }
@@ -973,40 +521,13 @@ void gettemperature() {
     return;
   }
 
-
-  //    double TempF;
-  //    int Humid;
-  //    TempF = double(temp_f);
-  //    Humid = int(humidity);
-
-  //    myPID.Compute();
-
-  //  lcd.backlight();
-  //  lcd.setCursor(0, 0);
-  //  lcd.print("Temp Set  Power");
-  //  lcd.setCursor(0, 1);
-  //  lcd.print(int(temp_f), 1);
-  //  lcd.setCursor(5, 1);
-  //  lcd.print(int(setPoint), 1);
-  //  lcd.setCursor(10, 1);
-  //  lcd.print(pidOutput, 1);
-  //  lcd.print("%");
-  //  if (stateVariable) {
-  //    lcd.setCursor(15, 1);
-  //    lcd.print("H");
-  //  }
-
   Serial.print("TE 44, ");
-//  yieldEspCPUTemp(44);
 
-//  Serial.print("getWebsiteHeaterState,");
+  //Get and set the current website heater state
   awsGetWebsiteHeaterState(&WebsiteHeaterState);
-//  Serial.print("WebsiteHeaterStateGot,");
-  
-//  yieldEspCPU();
+  yield();
   
   // Handling for various times and averages
-
   if (stateVariable)
   {
       heater_now = 100.00;
@@ -1017,15 +538,12 @@ void gettemperature() {
   }
 
   Serial.print("TE 45, ");
-//  yieldEspCPUTemp(45);
 
-//  Serial.print("pushTempToDB20s,");
+  //Push 20sec data to DyanmoDB
   PushTempToDynamoDB(temp_f, humidity, pidOutput, heater_now, TABLE_NAME1, HASH_KEY_NAME1, HASH_KEY_VALUE1, RANGE_KEY_NAME1);
-//  Serial.print("20spushdone,");
-  
+  yield();
   
   Serial.print("TE 46, ");
-//  yieldEspCPUTemp(46);
   
   //Adding cumulatively the values of the 20sec measurements
   temp_f_sum_20s = temp_f_sum_20s + temp_f;
@@ -1037,6 +555,7 @@ void gettemperature() {
   counter_20s++;
 
   Serial.print("TE 47, ");
+
   Serial.print("Epoch now: ");
     Serial.print(epoch_now);
   Serial.print(" Epoch last 5m: ");
@@ -1045,11 +564,11 @@ void gettemperature() {
     Serial.print(epoch_last_90m);
   Serial.print(" Epoch last 1d: ");
     Serial.print(epoch_last_1d);
-//  yieldEspCPUTemp(47);
 
+  //Handling once NTP time has passed 5min
   if (epoch_now - epoch_last_5m > 300) { 
 
-      yieldEspCPUTemp(48);
+      Serial.print("TE 48, ");
 
       //Averaging 20sec measurements and setting them to a 5min variable
       temp_f_inst_5m = temp_f_sum_20s / counter_20s;
@@ -1066,24 +585,15 @@ void gettemperature() {
       //Resetting 20sec measurement instance counter
       counter_20s = 0;
 
-      yieldEspCPUTemp(51);
-        
-      flagDontPushAvgTemp = false;
-    
-      //Ticking over 5m time counter
-      epoch_last_5m = epoch_now;
-    
-      //Adding cumulatively the values of the 5min measurements
-      temp_f_sum_5m = temp_f_sum_5m + temp_f_inst_5m;
-      humidity_sum_5m = humidity_sum_5m + humidity_inst_5m;
-      pid_sum_5m = pid_sum_5m + pid_inst_5m;
-      heater_sum_5m = heater_sum_5m + heater_inst_5m;
+      Serial.print("TE 49, ");
       
       //Incrementing 5min measurement instance counter
       counter_5m++;
 
-  //Writing values to RTC memory
-  RTCMemWrite();
+	  //Writing values to RTC memory in case of crash
+	  RTCMemWrite();
+      
+	  Serial.print("TE 50, ");
     
       //Sending 5m avg measurements
       if (!flagDontPushAvgTemp) {
@@ -1124,18 +634,20 @@ void gettemperature() {
         Serial.print(",");
         Serial.print(epoch_now - epoch_last_5m);
         Serial.println();
-        yieldEspCPUTemp(49);
-//        Serial.print("pushTempToDB5m,");
+	
+      Serial.print("TE 51, ");
+
         PushTempToDynamoDB(temp_f_inst_5m, humidity_inst_5m, pid_inst_5m, heater_inst_5m, TABLE_NAME3, HASH_KEY_NAME3, HASH_KEY_VALUE3, RANGE_KEY_NAME3);
-        yieldEspCPUTemp(50);
+  yield();
+	
+      Serial.print("TE 52, ");
+
       }
   }
 
-//  yieldEspCPU();
-  
   if (epoch_now - epoch_last_90m > 5400) {
 
-      yieldEspCPUTemp(52);
+      Serial.print("TE 53, ");
       
       //Averaging 90min measurements and setting them to a 90min variable
       temp_f_inst_90m = temp_f_sum_5m / counter_5m;
@@ -1152,7 +664,7 @@ void gettemperature() {
       //Resetting 5min measurement instance counter
       counter_5m = 0;
 
-      yieldEspCPUTemp(55);
+      Serial.print("TE 54, ");
       
       flagDontPushAvgTemp = false;
     
@@ -1170,6 +682,8 @@ void gettemperature() {
 
         //Writing values to RTC memory
   RTCMemWrite();
+
+      Serial.print("TE 55, ");
     
       //Sending 90m avg measurements
       if (!flagDontPushAvgTemp) {
@@ -1210,18 +724,21 @@ void gettemperature() {
         Serial.print(",");
         Serial.print(epoch_now - epoch_last_90m);
         Serial.println();
-        yieldEspCPUTemp(53);
+
+      Serial.print("TE 56, ");
+
         PushTempToDynamoDB(temp_f_inst_90m, humidity_inst_90m, pid_inst_90m, heater_inst_90m, TABLE_NAME4, HASH_KEY_NAME4, HASH_KEY_VALUE4, RANGE_KEY_NAME4);
-        yieldEspCPUTemp(54);
+  yield();
+
+      Serial.print("TE 57, ");
+
       }
      
   }
 
-//  yieldEspCPU();
-
     if (epoch_now - epoch_last_1d > 86400) {
       
-      yieldEspCPUTemp(56);
+      Serial.print("TE 58, ");
       
       //Averaging 1 day measurements and setting them to a 1 day variable
       temp_f_inst_1d = temp_f_sum_90m / counter_90m;
@@ -1237,8 +754,6 @@ void gettemperature() {
     
       //Resetting 90min measurement instance counter
       counter_90m = 0;
-
-      yieldEspCPUTemp(59);
       
       flagDontPushAvgTemp = false;
     
@@ -1256,6 +771,8 @@ void gettemperature() {
 
         //Writing values to RTC memory
   RTCMemWrite();
+
+      Serial.print("TE 59, ");
     
       //Sending 1d avg measurements
       if (!flagDontPushAvgTemp) {
@@ -1296,15 +813,19 @@ void gettemperature() {
         Serial.print(",");
         Serial.print(epoch_now - epoch_last_90m);
         Serial.println();
-        yieldEspCPUTemp(57);
+
+      Serial.print("TE 60, ");
+
         PushTempToDynamoDB(temp_f_inst_1d, humidity_inst_1d, pid_inst_1d, heater_inst_1d, TABLE_NAME5, HASH_KEY_NAME5, HASH_KEY_VALUE5, RANGE_KEY_NAME5);
-        yieldEspCPUTemp(58);
+  yield();
+
+      Serial.print("TE 61, ");
+
       }
 
   }
 
-//  yieldEspCPU();
-  
+//Currently not using the counter overflow watchdog - NTP time checking seems to be sufficient 
 //  if ((counter_20s > 20) || (counter_5m > 20) || (counter_90m > 20)) {
 //    Serial.println("Too many measurements for time period!");
 //    Serial.println("20sec measurements (per 5 min) now stored: ");
@@ -1316,14 +837,213 @@ void gettemperature() {
 //    flagDontPushAvgTemp = true;
 //    Serial.println("Halting publish of avg measurements to DynamoDB tables");
 //  }
-  
-  //  lcd.noBacklight();
-
-  //    setHeaterState(heaterOn);
 
 }
 
+void getWebsiteHeaterState(int *WebsiteHeaterState, GetItemOutput getItemOutput) {
+  char szC[6];
 
+  Serial.print("TE 7, ");
+
+  /* Get the "item" from the getItem output. */
+  MinimalMap < AttributeValue > attributeMap = getItemOutput.getItem();
+  AttributeValue av;
+
+  Serial.print("TE 8, ");
+      
+  attributeMap.get("WebsiteHeaterState", av);
+  *WebsiteHeaterState = atoi(av.getS().getCStr());
+
+  delay(10);
+}
+
+void awsGetWebsiteHeaterState(int *WebsiteHeaterState) {
+
+  Serial.print("TE 31, ");
+
+  /* Pull Heater State. */
+  AttributeValue id;
+  id.setS(HASH_KEY_VALUE2);
+  rangeKey.setN(RANGE_KEY_VALUE2);
+
+  Serial.print("TE 32, ");
+
+  MinimalKeyValuePair < MinimalString, AttributeValue > pair1(HASH_KEY_NAME2, id);
+  MinimalKeyValuePair < MinimalString, AttributeValue > pair2(RANGE_KEY_NAME2, rangeKey);
+  MinimalKeyValuePair<MinimalString, AttributeValue> keyArray[] = { pair1, pair2 };
+  getItemInput.setKey(MinimalMap < AttributeValue > (keyArray, KEY_SIZE));
+  
+  MinimalString attributesToGet[] = { "WebsiteHeaterState" };
+  getItemInput.setAttributesToGet(MinimalList < MinimalString > (attributesToGet, 1));
+
+  // Set Table Name
+  getItemInput.setTableName(TABLE_NAME2);
+
+  Serial.print("TE 33, ");
+
+  // Perform getItem and check for errors.
+  GetItemOutput getItemOutput = ddbClient.getItem(getItemInput, actionError);
+  yield();
+
+  Serial.print("TE 34, ");  
+
+  switch (actionError) {
+
+  Serial.print("TE 35, ");
+    
+    case NONE_ACTIONERROR:
+      getWebsiteHeaterState(WebsiteHeaterState, getItemOutput);
+      yield();
+      break;
+
+    case INVALID_REQUEST_ACTIONERROR:
+      Serial.print("ERROR: ");
+      Serial.println(getItemOutput.getErrorMessage().getCStr());
+      break;
+    case MISSING_REQUIRED_ARGS_ACTIONERROR:
+      Serial.println("ERROR: Required arguments were not set for GetItemInput");
+      break;
+    case RESPONSE_PARSING_ACTIONERROR:
+      Serial.println("ERROR: Problem parsing http response of GetItem\n");
+      break;
+    case CONNECTION_ACTIONERROR:
+      Serial.println("ERROR: Connection problem");
+      break;
+  }
+  
+  Serial.print("TE 36, ");
+}
+
+void PushTempToDynamoDB(float temp_f_update, float humidity_update, float pid_update, float heater_update, const char* T_N, const char* HK_N, const char* HK_V, const char* RK_N) {
+
+  Serial.print("TE 37, ");
+  
+    /* Create an Item. */
+  AttributeValue id;
+  id.setS(HK_V);
+  AttributeValue timest;
+
+  //Calculating my own time value for AWS given the last NTP time
+  time_t awstime = epoch + (awsoffset - millis()) / 1000; 
+  sprintf(awstimestr, "%04d%02d%02d%02d%02d%02d", year(awstime), month(awstime), day(awstime), hour(awstime), minute(awstime), second(awstime));
+
+  timest.setN(awstimestr);
+//  timest.setN(dateTimeProvider.getDateTime()); //Now using my own time system
+//  yield();
+
+  /* Create an AttributeValue for 'temp', convert the number to a
+     string (AttributeValue object represents numbers as strings), and
+     use setN to apply that value to the AttributeValue. */
+
+  int d1 = temp_f_update;
+  float f2 = temp_f_update - d1;
+  int d2 = f2 * 100 + 1;
+
+  char numberBuffer[20];
+  AttributeValue tempAttributeValue;
+  snprintf(numberBuffer, 20, "%d.%02d", d1, d2);
+  tempAttributeValue.setN(numberBuffer);
+
+  //AttributeValue for PID output
+  int d3 = pid_update;
+  float f3 = pid_update - d3;
+  int d4 = f3 * 100 + 1;
+
+  char pidBuffer[20];
+  AttributeValue pidAttributeValue;
+  snprintf(pidBuffer, 20, "%d.%02d", d3, d4);
+  pidAttributeValue.setN(pidBuffer);
+
+  //AttributeValue for heater output
+  int d7 = heater_update;
+  float f5 = heater_update - d7;
+  int d8 = f5 * 100 + 1;
+
+  char heaterbuffer[20];
+  AttributeValue heaterOnState;
+  snprintf(heaterbuffer, 20, "%d.%02d", d7, d8);
+  heaterOnState.setN(heaterbuffer);
+
+  //AttributeValue for humidity
+  int d5 = humidity_update;
+  float f4 = humidity_update - d5;
+  int d6 = f4 * 100 + 1;
+
+  char humidityBuffer[20];
+  AttributeValue humidityAttributeValue;
+  snprintf(humidityBuffer, 20, "%d.%02d", d5, d6);
+  humidityAttributeValue.setN(humidityBuffer);
+
+  /* Create the Key-value pairs and make an array of them. */
+  MinimalKeyValuePair < MinimalString, AttributeValue
+  > att1(HK_N, id);
+  MinimalKeyValuePair < MinimalString, AttributeValue
+  > att2(RK_N, timest);
+  MinimalKeyValuePair < MinimalString, AttributeValue
+  > att3("temp", tempAttributeValue);
+  MinimalKeyValuePair < MinimalString, AttributeValue
+  > att4("pidOutput", pidAttributeValue);
+  MinimalKeyValuePair < MinimalString, AttributeValue
+  > att5("heaterState", heaterOnState);
+  MinimalKeyValuePair < MinimalString, AttributeValue
+  > att6("humidity", humidityAttributeValue);
+  MinimalKeyValuePair<MinimalString, AttributeValue> itemArray[] = { att1,
+                                                                     att2, att3, att4, att5, att6
+                                                                   };
+
+  Serial.print("TE 38, ");
+
+  if (!isnan(temp_f)) {
+    
+    /* Set values for putItemInput. */
+    putItemInput.setItem(MinimalMap < AttributeValue > (itemArray, 6));
+    putItemInput.setTableName(T_N);
+    
+  Serial.print("TE 39, ");
+  
+    /* Perform putItem and check for errors. */
+
+    PutItemOutput putItemOutput = ddbClient.putItem(putItemInput,
+                                  actionError);
+  
+   Serial.print("TE 39.5, "); 
+
+    yield();
+
+  Serial.print("TE 40, ");
+    
+    switch (actionError) {
+      case NONE_ACTIONERROR:
+//        Serial.println("PutItem succeeded!");
+        break;
+      case INVALID_REQUEST_ACTIONERROR:
+        Serial.print("ERROR: Invalid request");
+        Serial.println(putItemOutput.getErrorMessage().getCStr());
+        break;
+      case MISSING_REQUIRED_ARGS_ACTIONERROR:
+        Serial.println(
+          "ERROR: Required arguments were not set for PutItemInput");
+        break;
+      case RESPONSE_PARSING_ACTIONERROR:
+        Serial.println("ERROR: Problem parsing http response of PutItem");
+        break;
+      case CONNECTION_ACTIONERROR:
+        Serial.println("ERROR: Connection problem");
+        break;
+    }
+    /* wait to not double-record */
+  }
+    Serial.print("DUBRECWAIT, ");
+
+  delay(2000);
+
+  Serial.print("PDUBRECWAIT, ");
+  
+}
+
+
+
+//Helper function to write the long-running data to RTC memory
 void RTCMemWrite() {
   
   rtcData.t5 = temp_f_sum_5m;    
@@ -1356,6 +1076,53 @@ void RTCMemWrite() {
   
 }
 
+void updateOutput() {
+  unsigned long now2 = millis();
+
+  //Don't compute the PID output if temp is invalid (will give an overflow as the PID output)
+  if (!isnan(temp_f)) {
+    myPID.Compute();
+  }
+
+  //Shift the window once past 30min
+  if (now2 - windowStartTime > windowSize) {
+    windowStartTime += windowSize;
+  }
+
+  //Heater control updates based on setting state and PID output - you can see at the start that this was based on the RF switch/outlet system, given the 'Outlet' helper function names
+  if ((WebsiteHeaterState == 1) && (stateVariable))
+  {
+    stateVariable = !stateVariable;
+    Serial.println("Manual Control set to Off & Heater is On - Turning it Off");
+    OffOutlet();
+    yield();
+  }
+  else if ((WebsiteHeaterState == 3) && (!stateVariable))
+  {
+    stateVariable = !stateVariable;
+    Serial.println("Manual Control set to On & Heater is Off - Turning it On");
+    OnOutlet();
+    yield();
+  }
+  //I need to investigate whether the thermostat will turn the heater back on during a cycle that it has already turned it off within - ideally, the heater should only come on at the beginning of the window - I could set an additional 'HasTurnedOff' bool if need be to fix this if it's an issue
+  else if ((WebsiteHeaterState == 2) && (pidOutput * windowSize > ((now2 - windowStartTime) * 100)) && (!stateVariable))
+  {
+    stateVariable = !stateVariable;
+    Serial.println("Automatic Control - Beginning of Window - Turning On");
+    OnOutlet();
+    yield();
+  }
+  else if ((WebsiteHeaterState == 2) && (pidOutput * windowSize < ((now2 - windowStartTime) * 100)) && (stateVariable))
+  {
+    stateVariable = !stateVariable;
+    Serial.println("Automatic Control - Turning Off");
+    OffOutlet();
+    yield();
+  }
+}
+
+
+//Flash LED and turn heater on - transistor setting read before and after setting it for debugging purposes
 void OnOutlet() {
   digitalWrite(LED_BUILTIN, LOW);
   delay(100);
@@ -1371,6 +1138,7 @@ void OnOutlet() {
   delay(500);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.println("Turning On Heater!");
+  //Currently not using the RF switch functionality
   //  mySwitch.send("000101010001110100000011");
   //  delay(500);
   //  digitalWrite(LED_BUILTIN, HIGH);
@@ -1381,6 +1149,7 @@ void OnOutlet() {
   //  digitalWrite(LED_BUILTIN, HIGH);
 }
 
+//Flash LED and turn heater off - transistor setting read before and after setting it for debugging purposes
 void OffOutlet() {
   digitalWrite(LED_BUILTIN, LOW);
   delay(100);
@@ -1396,6 +1165,7 @@ void OffOutlet() {
   delay(500);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.println("Turning Off Heater!"); //
+  //Currently not using the RF switch functionality
   //  digitalWrite(LED_BUILTIN, LOW);
   //  mySwitch.send("000101010001110100001100");
   //  delay(500);
