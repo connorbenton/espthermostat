@@ -9,6 +9,7 @@
 #include <DHT.h>
 #include <Wire.h>
 #include <RCSwitch.h>
+#include <Time.h>
 #include <TimeLib.h>
 //Not using a LCD screen anymore - deprecated
 //#include <LiquidCrystal_I2C.h>
@@ -165,6 +166,7 @@ void setup()
   Serial.println("Serial initialized...");
 
   // Set pins for transistor and onboard LED blink
+  pinMode(2, OUTPUT);
   pinMode(transistorPin, OUTPUT);
   pinMode(LED_BUILTIN, OUTPUT);
 
@@ -208,6 +210,11 @@ void setup()
   digitalWrite(LED_BUILTIN, LOW);
   delay(2000);
   digitalWrite(LED_BUILTIN, HIGH);
+  delay(2000);
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(2000);
+  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(2, LOW);
   
   //Initialize PID limits
   myPID.SetMode(AUTOMATIC);
@@ -925,8 +932,9 @@ void PushTempToDynamoDB(float temp_f_update, float humidity_update, float pid_up
 
   //Calculating my own time value for AWS given the last NTP time
   time_t awstime = epoch + (awsoffset - millis()) / 1000; 
+  char awstimestr[14];
   sprintf(awstimestr, "%04d%02d%02d%02d%02d%02d", year(awstime), month(awstime), day(awstime), hour(awstime), minute(awstime), second(awstime));
-
+  Serial.print(awstimestr);
   timest.setN(awstimestr);
 //  timest.setN(dateTimeProvider.getDateTime()); //Now using my own time system
 //  yield();
