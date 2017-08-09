@@ -85,6 +85,9 @@ unsigned long epoch, epoch_initial, epoch_now, epoch_last_5m, epoch_last_90m, ep
 //Currently not in use, this is a setting that should trip and stop average uploads if too many lower level time periods have passed (i.e. if the 5min average has taken 100 measurements of 20sec apiece)
 bool flagDontPushAvgTemp = false; 
 
+//Setting to load RTC memory data
+bool RTCMemValid = false;
+
 // PID tuning variables 
 double KP = 25;
 double KI = 0.028;
@@ -214,7 +217,7 @@ void setup()
   digitalWrite(LED_BUILTIN, LOW);
   delay(2000);
   digitalWrite(LED_BUILTIN, HIGH);
-  digitalWrite(2, LOW);
+  digitalWrite(2, HIGH);
   
   //Initialize PID limits
   myPID.SetMode(AUTOMATIC);
@@ -253,26 +256,7 @@ void setup()
     }
     else {
       Serial.println("CRC32 check ok, data is probably valid.");
-
-  temp_f_sum_5m = rtcData.t5;    
-  temp_f_sum_90m = rtcData.t90;
-      
-  humidity_sum_5m = rtcData.u5;    
-  humidity_sum_90m = rtcData.u90;
-      
-  pid_sum_5m = rtcData.p5;    
-  pid_sum_90m = rtcData.p90;
-      
-  heater_sum_5m = rtcData.h5;    
-  heater_sum_90m = rtcData.h90;
-
-  counter_5m = rtcData.c5;
-  counter_90m = rtcData.c90;
-
-  epoch_initial = rtcData.initial;
-  epoch_last_90m = rtcData.last90;
-  epoch_last_1d = rtcData.last1d;
-  
+      RTCMemValid = true;
     }
     
   }
@@ -332,16 +316,41 @@ void loop() {
   if (time) {
 	    epoch = time;
 	    
-	    //Setting inital average update times if they do not exist (after inialization or in RTC memory)
+	    //Setting inital average update times if they do not exist (from inialization or in RTC memory)
 	    if (!epoch_initial) {
+
+      if (((epoch - rtcData.initial) < 86400) && (RTCMemValid)) {
+        Serial.println();
+        Serial.println("RTC memory valid, and RTC initial date less than 1 day ago. Initializing with RTC data");
+          temp_f_sum_5m = rtcData.t5;    
+          temp_f_sum_90m = rtcData.t90;
+              
+          humidity_sum_5m = rtcData.u5;    
+          humidity_sum_90m = rtcData.u90;
+              
+          pid_sum_5m = rtcData.p5;    
+          pid_sum_90m = rtcData.p90;
+              
+          heater_sum_5m = rtcData.h5;    
+          heater_sum_90m = rtcData.h90;
+        
+          counter_5m = rtcData.c5;
+          counter_90m = rtcData.c90;
+        
+          epoch_initial = rtcData.initial;
+          epoch_last_90m = rtcData.last90;
+          epoch_last_1d = rtcData.last1d;
+          epoch_last_5m = epoch;    //Just in case RTC memory loads a update time for 90m/1d that would be sooner than the 5m
+      }
+      else {      
 	    epoch_initial = epoch;
 	    epoch_last_5m = epoch;
 	    epoch_last_90m = epoch;
 	    epoch_last_1d = epoch;
 	    } 
-	  if (!epoch_last_5m) {
-	    //Just in case RTC memory loads a update time for 90m/1d that would be sooner than the 5m
-	      epoch_last_5m = epoch;
+//	  if (!epoch_last_5m) {
+//	    //Just in case RTC memory loads a update time for 90m/1d that would be sooner than the 5m
+//	      epoch_last_5m = epoch;
 	  }
 	    epoch_now = epoch;
 	    Serial.println("Time successful");
@@ -592,7 +601,16 @@ void gettemperature() {
       //Resetting 20sec measurement instance counter
       counter_20s = 0;
 
+      //Ticking over 90m time counter
+      epoch_last_5m = epoch_now;
+
       Serial.print("TE 49, ");
+
+      //Adding cumulatively the values of the 5min measurements
+      temp_f_sum_5m = temp_f_sum_5m + temp_f_inst_5m;
+      humidity_sum_5m = humidity_sum_5m + humidity_inst_5m;
+      pid_sum_5m = pid_sum_5m + pid_inst_5m;
+      heater_sum_5m = heater_sum_5m + heater_inst_5m;
       
       //Incrementing 5min measurement instance counter
       counter_5m++;
@@ -931,7 +949,7 @@ void PushTempToDynamoDB(float temp_f_update, float humidity_update, float pid_up
   AttributeValue timest;
 
   //Calculating my own time value for AWS given the last NTP time
-  time_t awstime = epoch + (awsoffset - millis()) / 1000; 
+  time_t awstime = epoch + ((millis() - awsoffset) / 1000); 
   char awstimestr[14];
   sprintf(awstimestr, "%04d%02d%02d%02d%02d%02d", year(awstime), month(awstime), day(awstime), hour(awstime), minute(awstime), second(awstime));
   Serial.print(awstimestr);
@@ -1077,6 +1095,7 @@ void RTCMemWrite() {
   rtcData.crc32 = calculateCRC32(((uint8_t*) &rtcData) + 4, sizeof(rtcData) - 4);
   // Write struct to RTC memory
   if (ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData))) {
+    Serial.println();
     Serial.println("Write: ");
     printMemory();
     Serial.println();
